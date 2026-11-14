@@ -1,8 +1,12 @@
 
-"""Ollama-powered Data Quality Detective agent.
+"""
+AI-Powered Data Quality Detective
+LangGraph-based intelligent agent.
 
-The LLM proposes a plan; Python tools perform verifiable operations.
-The agent keeps episodic memory and uses feedback to adjust future priorities.
+Framework: LangGraph
+LLM: Qwen3 through Ollama
+Memory: Existing SQLite AgentMemory
+Tools: Existing tools.py
 """
 
 from __future__ import annotations
@@ -10,10 +14,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any
+
+from typing import Any, TypedDict
 
 import pandas as pd
 import requests
+
+from langgraph.graph import StateGraph, START, END
 
 from tools import (
     profile_dataset,
@@ -25,9 +32,9 @@ from tools import (
 from memory import AgentMemory
 
 
-# ---------------------------------------------------------
-# 1. AVAILABLE TOOLS
-# ---------------------------------------------------------
+# =========================================================
+# 1. AVAILABLE PYTHON TOOLS
+# =========================================================
 
 AVAILABLE_TOOLS = {
     "profile_dataset": profile_dataset,
@@ -37,157 +44,162 @@ AVAILABLE_TOOLS = {
 }
 
 
-# ---------------------------------------------------------
-# 2. DATA QUALITY AGENT
-# ---------------------------------------------------------
+# =========================================================
+# 2. LANGGRAPH SHARED STATE
+# =========================================================
+
+class InvestigationState(TypedDict, total=False):
+
+    # Input
+    df: Any
+    user_goal: str
+
+    # Planning
+    plan: dict
+    steps: list
+
+    # Tool execution
+    observations: dict
+    trace: list
+
+    # Explanation
+    summary: str
+
+    # Timing and status
+    started_at: float
+    latency_seconds: float
+    error: str
+
+    # Final output
+    final_result: dict
+
+
+# =========================================================
+# 3. DATA QUALITY AGENT
+# =========================================================
 
 class DataQualityAgent:
 
     def __init__(
         self,
         model: str = "qwen3:8b",
-        ollama_url: str = "http://127.0.0.1:11434",
+        ollama_url: str = "http://localhost:11434",
         memory_path: str = "outputs/agent_memory.db",
     ):
 
         self.model = model
         self.ollama_url = ollama_url.rstrip("/")
+
         self.memory = AgentMemory(memory_path)
+
         self.trace = []
 
-        self.session = requests.Session()
+        # Build the actual LangGraph workflow.
+        self.graph = self._build_graph()
 
-    # -----------------------------------------------------
-    # 3. COMMUNICATE WITH QWEN3
-    # -----------------------------------------------------
+    # =====================================================
+    # 4. OLLAMA CONNECTION
+    # =====================================================
 
     def _ask_qwen(
         self,
         prompt: str,
-        temperature: float = 0.1
+        temperature: float = 0.1,
     ) -> str:
 
-        """Call the locally hosted Qwen3 model through Ollama."""
+        """Send a prompt to the local Qwen3 model."""
 
-        try:
-
-            response = self.session.post(
-                f"{self.ollama_url}/api/chat",
-
-                json={
-                    "model": self.model,
-
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
-
-                    "stream": False,
-
-                    "think": False,
-
-                    "options": {
-                        "temperature": temperature,
-                        "num_predict": 256,
-                        "num_ctx": 2048
+        response = requests.post(
+            f"{self.ollama_url}/api/chat",
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
                     }
+                ],
+                "stream": False,
+                "think": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": 512,
+                    "num_ctx": 4096,
                 },
-
-                timeout=300,
-            )
-
-            response.raise_for_status()
-
-            data = response.json()
-
-            content = data.get("message", {}).get("content", "")
-
-            if not content.strip():
-                raise ValueError("Qwen3 returned an empty response.")
-
-            return content.strip()
-
-        except requests.exceptions.Timeout as exc:
-
-            raise RuntimeError(
-                "Qwen3 took too long to respond. "
-                "Try a smaller model or reduce the prompt size."
-            ) from exc
-
-        except requests.exceptions.ConnectionError as exc:
-
-            raise RuntimeError(
-                "Cannot connect to Ollama. "
-                "Please make sure the Ollama application is running."
-            ) from exc
-
-        except requests.exceptions.HTTPError as exc:
-
-            raise RuntimeError(
-                f"Ollama API error: {exc}. "
-                "Check that the model is available and Ollama is updated."
-            ) from exc
-
-    # -----------------------------------------------------
-    # 4. CLEAN AND EXTRACT JSON
-    # -----------------------------------------------------
-
-    def _extract_json(self, raw: str) -> dict:
-
-        """Extract a JSON object from the model response."""
-
-        raw = re.sub(
-            r"<think>.*?</think>",
-            "",
-            raw,
-            flags=re.S
-        ).strip()
-
-        raw = re.sub(
-            r"```(?:json)?",
-            "",
-            raw,
-            flags=re.I
+            },
+            timeout=300,
         )
 
-        raw = raw.replace("```", "").strip()
+        response.raise_for_status()
 
-        # Find the JSON object in the response.
-        start = raw.find("{")
-        end = raw.rfind("}")
+        content = response.json()["message"]["content"]
 
-        if start == -1 or end == -1 or end < start:
-            raise ValueError("No valid JSON object found.")
+        content = re.sub(
+            r"<think>.*?</think>",
+            "",
+            content,
+            flags=re.S,
+        ).strip()
 
-        return json.loads(raw[start:end + 1])
+        return content
 
-    # -----------------------------------------------------
-    # 5. AGENT PLANNING
-    # -----------------------------------------------------
+    # =====================================================
+    # 5. PLANNING LOGIC
+    # =====================================================
 
     def _plan(
         self,
         user_goal: str,
-        columns: list[str]
-    ) -> dict[str, Any]:
+        columns: list[str],
+    ) -> dict:
 
-        """Ask Qwen3 to select tools from a strict allow-list."""
+        """Ask Qwen3 to select tools for the investigation."""
+
+        feedback = self.feedback_guidance()
 
         prompt = f"""
-You are the planning component of a data quality agent.
+You are the planning component of an intelligent
+Data Quality Detective agent.
 
-Choose a safe multi-step plan for the user's dataset task.
+Your task is to create a safe investigation plan.
 
-Available tools and purposes:
+AVAILABLE TOOLS:
 
-- profile_dataset: dataset dimensions, data types and descriptive statistics.
-- detect_quality_issues: missing values, duplicate rows, constant columns and suspicious values.
-- detect_anomalies: numeric outlier candidates using IQR.
-- create_cleaning_preview: propose conservative cleaning actions without changing original data.
+1. profile_dataset
+   Understand dataset structure, dimensions and statistics.
 
-Return ONLY valid JSON with these keys:
+2. detect_quality_issues
+   Find missing values, duplicate rows, constant columns
+   and blank text values.
+
+3. detect_anomalies
+   Identify numerical outlier candidates using IQR.
+
+4. create_cleaning_preview
+   Suggest non-destructive data cleaning actions.
+
+IMPORTANT RULES:
+
+- Only use the four exact tool names.
+- Do not invent tools or columns.
+- Select tools relevant to the user's request.
+- For a general investigation, include all four tools.
+- Do not modify the uploaded dataset.
+- Outliers are candidates, not confirmed errors.
+
+USER REQUEST:
+
+{user_goal}
+
+DATASET COLUMNS:
+
+{columns}
+
+PREVIOUS USER FEEDBACK:
+
+{feedback}
+
+Return ONLY valid JSON in this format:
 
 {{
     "reasoning": "Short explanation of the plan",
@@ -195,36 +207,41 @@ Return ONLY valid JSON with these keys:
         {{
             "tool": "profile_dataset",
             "purpose": "Understand the dataset"
+        }},
+        {{
+            "tool": "detect_quality_issues",
+            "purpose": "Check data quality"
         }}
     ]
 }}
-
-Rules:
-1. Only use the four exact tool names listed above.
-2. Include profile_dataset for a general investigation.
-3. Include detect_quality_issues for a general investigation.
-4. Select other relevant tools when necessary.
-5. Do not invent dataset columns.
-6. Do not include Markdown or additional explanations outside the JSON.
-
-User goal:
-{user_goal}
-
-Dataset columns:
-{columns}
 """
 
         try:
 
             raw = self._ask_qwen(prompt)
 
-            plan = self._extract_json(raw)
+            raw = re.sub(
+                r"^```(?:json)?|```$",
+                "",
+                raw,
+                flags=re.M,
+            ).strip()
 
-            steps = plan.get("steps", [])
+            match = re.search(
+                r"\{.*\}",
+                raw,
+                flags=re.S,
+            )
+
+            if not match:
+                raise ValueError("No JSON plan returned by Qwen3")
+
+            plan = json.loads(match.group())
 
             safe_steps = []
+            already_selected = set()
 
-            for step in steps:
+            for step in plan.get("steps", []):
 
                 if not isinstance(step, dict):
                     continue
@@ -233,115 +250,124 @@ Dataset columns:
 
                 if (
                     name in AVAILABLE_TOOLS
-                    and name not in [s["tool"] for s in safe_steps]
+                    and name not in already_selected
                 ):
 
-                    safe_steps.append(
-                        {
-                            "tool": name,
-                            "purpose": str(
-                                step.get("purpose", "")
-                            )[:300]
-                        }
-                    )
+                    safe_steps.append({
+                        "tool": name,
+                        "purpose": str(
+                            step.get("purpose", "")
+                        )[:300],
+                    })
+
+                    already_selected.add(name)
 
             if not safe_steps:
-                raise ValueError("No valid tools selected.")
+                raise ValueError("No valid tools in plan")
 
             return {
                 "reasoning": str(
-                    plan.get("reasoning", "Qwen3 generated a tool plan.")
+                    plan.get("reasoning", "")
                 ),
-
                 "steps": safe_steps,
-
+                "framework": "LangGraph",
                 "fallback": False,
             }
 
         except Exception as exc:
 
-            # Safe deterministic fallback.
-            # The agent can still operate without a valid LLM plan.
+            # Safe fallback if Qwen3 is unavailable
+            # or returns an invalid plan.
 
             return {
                 "reasoning": (
-                    "Safe fallback plan used because Qwen3 "
-                    f"could not generate a valid plan: {str(exc)}"
+                    "A predefined safe investigation plan "
+                    "was selected because the LLM plan "
+                    f"was unavailable or invalid: {exc}"
                 ),
-
                 "steps": [
                     {
                         "tool": "profile_dataset",
-                        "purpose": "Understand dataset structure"
+                        "purpose": "Profile the dataset",
                     },
                     {
                         "tool": "detect_quality_issues",
-                        "purpose": "Inspect common data quality problems"
+                        "purpose": "Identify quality problems",
                     },
                     {
                         "tool": "detect_anomalies",
-                        "purpose": "Check numeric columns for outlier candidates"
+                        "purpose": "Identify potential outliers",
                     },
                     {
                         "tool": "create_cleaning_preview",
-                        "purpose": "Prepare a non-destructive cleaning preview"
+                        "purpose": "Suggest cleaning actions",
                     },
                 ],
-
+                "framework": "LangGraph",
                 "fallback": True,
             }
 
-    # -----------------------------------------------------
-    # 6. EXECUTE SELECTED TOOLS
-    # -----------------------------------------------------
+    # =====================================================
+    # 6. NODE 1: PLANNING
+    # =====================================================
 
-    def investigate(
+    def planning_node(
         self,
-        df: pd.DataFrame,
-        user_goal: str = (
-            "Investigate this dataset and report its data quality."
-        )
+        state: InvestigationState,
     ) -> dict:
 
-        """Perceive -> plan -> select tools -> act -> observe -> reflect."""
+        """LangGraph planning node."""
 
-        started = time.time()
+        df = state["df"]
 
-        self.trace = []
+        user_goal = state["user_goal"]
 
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError("Input must be a pandas DataFrame.")
+        columns = [
+            str(column)
+            for column in df.columns
+        ]
 
-        if df.empty:
-            raise ValueError("The uploaded dataset is empty.")
-
-        # STEP 1: Planning
         plan = self._plan(
             user_goal,
-            [str(c) for c in df.columns]
+            columns,
         )
 
-        if plan.get("fallback"):
-            self.trace.append(
-                {
-                    "tool": "planning",
-                    "status": "fallback",
-                    "purpose": plan["reasoning"]
-                }
-            )
-        else:
-            self.trace.append(
-                {
-                    "tool": "planning",
-                    "status": "success",
-                    "purpose": plan["reasoning"]
-                }
-            )
+        trace = state.get("trace", []).copy()
 
-        # STEP 2: Tool execution
+        trace.append({
+            "node": "planning_node",
+            "framework": "LangGraph",
+            "status": "success",
+            "description": (
+                "Qwen3 generated and validated the "
+                "investigation plan."
+            ),
+        })
+
+        return {
+            "plan": plan,
+            "steps": plan["steps"],
+            "trace": trace,
+        }
+
+    # =====================================================
+    # 7. NODE 2: TOOL EXECUTION
+    # =====================================================
+
+    def tool_execution_node(
+        self,
+        state: InvestigationState,
+    ) -> dict:
+
+        """LangGraph node for executing Python tools."""
+
+        df = state["df"]
+
         observations = {}
 
-        for step in plan["steps"]:
+        trace = state.get("trace", []).copy()
+
+        for step in state.get("steps", []):
 
             tool_name = step["tool"]
 
@@ -353,13 +379,12 @@ Dataset columns:
 
                 observations[tool_name] = result
 
-                self.trace.append(
-                    {
-                        "tool": tool_name,
-                        "status": "success",
-                        "purpose": step["purpose"]
-                    }
-                )
+                trace.append({
+                    "node": "tool_execution_node",
+                    "tool": tool_name,
+                    "status": "success",
+                    "purpose": step["purpose"],
+                })
 
             except Exception as exc:
 
@@ -367,130 +392,303 @@ Dataset columns:
                     "error": str(exc)
                 }
 
-                self.trace.append(
-                    {
-                        "tool": tool_name,
-                        "status": "failed",
-                        "error": str(exc)
-                    }
-                )
+                trace.append({
+                    "node": "tool_execution_node",
+                    "tool": tool_name,
+                    "status": "failed",
+                    "error": str(exc),
+                })
 
-        # STEP 3: Generate explanation
-        summary = self._synthesise(
-            user_goal,
-            observations
-        )
+        trace.append({
+            "node": "tool_execution_node",
+            "status": "success",
+            "description": (
+                "LangGraph executed the selected "
+                "Python data analysis tools."
+            ),
+        })
 
-        # STEP 4: Record execution time
-        elapsed = round(
-            time.time() - started,
-            3
-        )
-
-        # STEP 5: Final result
-        result = {
-
-            "goal": user_goal,
-
-            "plan": plan,
-
+        return {
             "observations": observations,
-
-            "summary": summary,
-
-            "trace": self.trace,
-
-            "latency_seconds": elapsed,
+            "trace": trace,
         }
 
-        # STEP 6: Save episodic memory
-        self.memory.save_episode(
-            user_goal,
-            result
+    # =====================================================
+    # 8. NODE 3: EXPLANATION
+    # =====================================================
+
+    def explanation_node(
+        self,
+        state: InvestigationState,
+    ) -> dict:
+
+        """LangGraph explanation node."""
+
+        observations = state.get(
+            "observations", {}
         )
 
-        return result
-
-    # -----------------------------------------------------
-    # 7. SYNTHESISE FINDINGS
-    # -----------------------------------------------------
-
-    def _synthesise(
-        self,
-        goal: str,
-        observations: dict
-    ) -> str:
-
-        """Use Qwen3 to explain verified Python tool results."""
-
         prompt = f"""
-You are Qwen3, the explanation component of a data quality agent.
+You are the explanation component of an
+AI-Powered Data Quality Detective.
 
-Explain the findings in clear, simple and cautious language.
+Explain the dataset investigation findings clearly.
 
-Instructions:
+USER REQUEST:
 
-1. Explain the important data quality findings.
-2. Distinguish confirmed facts from possible anomalies.
-3. Never claim that an outlier is definitely an error.
-4. Do not invent statistics or dataset information.
-5. Recommend practical next steps.
-6. Preserve the original dataset.
-7. Use headings and bullet points where helpful.
-8. Keep the explanation concise.
+{state.get("user_goal", "")}
 
-User goal:
-{goal}
+VERIFIED PYTHON TOOL RESULTS:
 
-Tool observations (the only source of dataset facts):
+{json.dumps(observations, default=str)[:14000]}
 
-{json.dumps(observations, default=str)[:10000]}
+INSTRUCTIONS:
+
+1. Explain the important findings.
+2. Identify missing values and duplicates.
+3. Discuss numerical outlier candidates.
+4. Give practical recommendations.
+5. Do not invent statistics.
+6. Do not claim an outlier is definitely an error.
+7. Explain that cleaning should be reviewed by the user.
+8. Use simple, professional language.
 """
 
         try:
 
-            return self._ask_qwen(prompt)
+            summary = self._ask_qwen(prompt)
 
         except Exception as exc:
 
-            return (
-                "Qwen3 explanation unavailable. "
-                "The Python tool results are still available. "
-                f"Reason: {str(exc)}"
+            summary = (
+                "The Python analysis tools completed, but "
+                "Qwen3 could not generate an explanation. "
+                f"Reason: {exc}. "
+                "Please review the structured observations."
             )
 
-    # -----------------------------------------------------
-    # 8. FOLLOW-UP QUESTIONS
-    # -----------------------------------------------------
+        trace = state.get("trace", []).copy()
+
+        trace.append({
+            "node": "explanation_node",
+            "status": "success",
+            "description": (
+                "Qwen3 generated an explanation "
+                "from the verified tool observations."
+            ),
+        })
+
+        return {
+            "summary": summary,
+            "trace": trace,
+        }
+
+    # =====================================================
+    # 9. NODE 4: SQLITE MEMORY
+    # =====================================================
+
+    def memory_node(
+        self,
+        state: InvestigationState,
+    ) -> dict:
+
+        """LangGraph memory node."""
+
+        elapsed = round(
+            time.time() - state["started_at"],
+            3,
+        )
+
+        trace = state.get("trace", []).copy()
+
+        trace.append({
+            "node": "memory_node",
+            "status": "success",
+            "description": (
+                "Investigation episode saved to SQLite memory."
+            ),
+        })
+
+        result = {
+            "goal": state["user_goal"],
+            "plan": state.get("plan", {}),
+            "observations": state.get(
+                "observations", {}
+            ),
+            "summary": state.get("summary", ""),
+            "trace": trace,
+            "latency_seconds": elapsed,
+            "framework": "LangGraph",
+        }
+
+        try:
+
+            self.memory.save_episode(
+                state["user_goal"],
+                result,
+            )
+
+        except Exception as exc:
+
+            trace.append({
+                "node": "memory_node",
+                "status": "failed",
+                "error": str(exc),
+            })
+
+            result["trace"] = trace
+
+        return {
+            "latency_seconds": elapsed,
+            "final_result": result,
+            "trace": trace,
+        }
+
+    # =====================================================
+    # 10. BUILD LANGGRAPH WORKFLOW
+    # =====================================================
+
+    def _build_graph(self):
+
+        """Construct and compile the LangGraph StateGraph."""
+
+        workflow = StateGraph(
+            InvestigationState
+        )
+
+        # Register graph nodes.
+
+        workflow.add_node(
+            "planning",
+            self.planning_node,
+        )
+
+        workflow.add_node(
+            "tool_execution",
+            self.tool_execution_node,
+        )
+
+        workflow.add_node(
+            "explanation",
+            self.explanation_node,
+        )
+
+        workflow.add_node(
+            "memory",
+            self.memory_node,
+        )
+
+        # Define graph connections.
+
+        workflow.add_edge(
+            START,
+            "planning",
+        )
+
+        workflow.add_edge(
+            "planning",
+            "tool_execution",
+        )
+
+        workflow.add_edge(
+            "tool_execution",
+            "explanation",
+        )
+
+        workflow.add_edge(
+            "explanation",
+            "memory",
+        )
+
+        workflow.add_edge(
+            "memory",
+            END,
+        )
+
+        # Compile into an executable graph.
+
+        return workflow.compile()
+
+    # =====================================================
+    # 11. RUN INVESTIGATION
+    # =====================================================
+
+    def investigate(
+        self,
+        df: pd.DataFrame,
+        user_goal: str = (
+            "Investigate this dataset and identify "
+            "data quality problems."
+        ),
+    ) -> dict:
+
+        """Execute the complete LangGraph workflow."""
+
+        self.trace = []
+
+        initial_state = {
+
+            "df": df.copy(deep=True),
+
+            "user_goal": user_goal,
+
+            "observations": {},
+
+            "trace": [],
+
+            "started_at": time.time(),
+
+        }
+
+        # Actual LangGraph execution.
+
+        graph_result = self.graph.invoke(
+            initial_state
+        )
+
+        result = graph_result["final_result"]
+
+        self.trace = result["trace"]
+
+        return result
+
+    # =====================================================
+    # 12. FOLLOW-UP QUESTIONS
+    # =====================================================
 
     def answer_question(
         self,
         question: str,
-        latest_result: dict
+        latest_result: dict,
     ) -> str:
 
-        """Answer follow-up questions using tool evidence and memory."""
+        """Answer questions using investigation evidence."""
 
-        recent = self.memory.recent_episodes(limit=3)
+        recent = self.memory.recent_episodes(
+            limit=3
+        )
 
         prompt = f"""
-Answer the user's question using only the evidence below.
+You are a data quality assistant.
 
-If the evidence is insufficient, say so and suggest
-which investigation would help.
+Answer the user's question using the
+verified investigation evidence.
 
-Do not fabricate values.
+QUESTION:
 
-Question:
 {question}
 
-Latest verified tool observations:
+LATEST INVESTIGATION:
 
-{json.dumps(latest_result.get('observations', {}), default=str)[:8000]}
+{json.dumps(latest_result.get('observations', {}), default=str)[:12000]}
 
-Recent episodic memory:
+RECENT MEMORY:
 
-{json.dumps(recent, default=str)[:2000]}
+{json.dumps(recent, default=str)[:3000]}
+
+Do not invent statistics.
+If the information is unavailable, say so.
+Use clear and simple language.
 """
 
         try:
@@ -500,47 +698,74 @@ Recent episodic memory:
         except Exception as exc:
 
             return (
-                f"Qwen3 is unavailable: {str(exc)}"
+                "Qwen3 is currently unavailable. "
+                f"Error: {exc}"
             )
 
-    # -----------------------------------------------------
-    # 9. RECORD USER FEEDBACK
-    # -----------------------------------------------------
+    # =====================================================
+    # 13. USER FEEDBACK
+    # =====================================================
 
     def record_feedback(
         self,
         rating: int,
         comment: str,
-        issue_category: str = "general"
+        issue_category: str = "general",
     ) -> None:
 
-        """Save user feedback for future adaptation."""
+        """Store feedback in SQLite memory."""
 
         self.memory.save_feedback(
             rating,
             comment,
-            issue_category
+            issue_category,
         )
 
-    # -----------------------------------------------------
-    # 10. ADAPT FUTURE PRIORITIES
-    # -----------------------------------------------------
+    # =====================================================
+    # 14. MEMORY GUIDANCE
+    # =====================================================
 
     def feedback_guidance(self) -> str:
 
-        """Prioritise categories users previously found useful."""
+        """Retrieve feedback guidance from SQLite."""
 
-        feedback = self.memory.feedback_summary()
+        try:
 
-        if not feedback:
+            feedback = self.memory.feedback_summary()
+
+            if not feedback:
+
+                return (
+                    "No previous feedback available. "
+                    "Use balanced investigation priorities."
+                )
 
             return (
-                "No feedback history yet; "
-                "use balanced investigation priorities."
+                f"Previous feedback: {feedback}. "
+                "Consider these concerns when planning "
+                "the next investigation."
             )
 
-        return (
-            "Past user feedback summary: "
-            f"{feedback}. "
-            "Prioritise these concerns in the next explanation."
-        )
+        except Exception:
+
+            return (
+                "Feedback guidance is unavailable. "
+                "Use balanced investigation priorities."
+            )
+
+    # =====================================================
+    # 15. GRAPH VISUALIZATION
+    # =====================================================
+
+    def get_graph_mermaid(self) -> str:
+
+        """Return a Mermaid representation of the workflow."""
+
+        return """
+graph TD
+    A([START]) --> B[Planning Node - Qwen3]
+    B --> C[Tool Execution Node]
+    C --> D[Explanation Node - Qwen3]
+    D --> E[SQLite Memory Node]
+    E --> F([END])
+        """.strip()

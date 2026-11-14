@@ -1,0 +1,8 @@
+Student_ID,Department,Attendance,Study_Hours,Exam_Score
+S001,DSDA,92,4,85
+S002,English,88,3,78
+S003,DSDA,,5,91
+S004,Science,75,2,65
+S005,DSDA,150,6,98
+S006,English,88,3,78
+S007,Science,81,4,73

@@ -1,4 +1,5 @@
-# Python
+
+# Python cache files
 __pycache__/
 *.py[cod]
 *.so
@@ -8,24 +9,39 @@ venv/
 .venv/
 env/
 
-# Jupyter
+# Jupyter Notebook
 .ipynb_checkpoints/
 
-# Operating system
+# macOS system files
 .DS_Store
+.AppleDouble
+.LSOverride
 
-# Environment variables and secrets
+# Environment variables and sensitive information
 .env
 .env.*
+!.env.example
 
-# SQLite databases
+# SQLite databases and runtime memory
 *.db
 *.sqlite
 *.sqlite3
 
-# Temporary files
+# Log and temporary files
 *.log
 *.tmp
 
-# Generated caches
+# Testing and cache folders
 .pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Build files
+build/
+dist/
+*.egg-info/
