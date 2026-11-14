@@ -1,0 +1,11 @@
+Test_ID,Scenario,Input condition,Expected behaviour,Expected tools
+TC01,Standard dataset,CSV with numeric and categorical columns,Profile and identify quality issues,profile_dataset;detect_quality_issues
+TC02,Excel workbook,Workbook with two sheets,Allow user to select one sheet and investigate it,profile_dataset;detect_quality_issues
+TC03,Missing values,Dataset with null cells,Report missing counts and percentages,detect_quality_issues
+TC04,Duplicate rows,Dataset containing exact duplicate rows,Count duplicate rows and recommend review,detect_quality_issues;create_cleaning_preview
+TC05,Numeric outliers,Numeric column with extreme values,Report IQR candidates without calling them definite errors,detect_anomalies
+TC06,No numeric columns,Only text/category columns,Complete profile and quality checks without crashing,profile_dataset;detect_quality_issues
+TC07,Small dataset,One to three rows,Report limitations and skip unsuitable IQR checks,profile_dataset;detect_anomalies
+TC08,Ollama unavailable,Stop Ollama service,Show fallback/error clearly and retain deterministic findings where possible,profile_dataset;detect_quality_issues
+TC09,Malformed plan,Model returns invalid JSON,Use safe allow-listed fallback plan,profile_dataset;detect_quality_issues;detect_anomalies;create_cleaning_preview
+TC10,Feedback,Submit rating and category,Store feedback in SQLite and make summary available,feedback memory
